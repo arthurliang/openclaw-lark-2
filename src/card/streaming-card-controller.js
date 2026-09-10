@@ -635,21 +635,51 @@ class StreamingCardController {
                         seqBefore: seqBeforeUpdate,
                         seqAfter: this.cardKit.cardKitSequence,
                     });
-                    await (0, cardkit_1.updateCardKitCard)({
-                        cfg: this.deps.cfg,
-                        cardId: idleEffectiveCardId,
-                        card: (0, builder_1.toCardKit2)(completeCard),
-                        sequence: this.cardKit.cardKitSequence,
-                        accountId: this.deps.accountId,
-                    });
+                    try {
+                        await (0, cardkit_1.updateCardKitCard)({
+                            cfg: this.deps.cfg,
+                            cardId: idleEffectiveCardId,
+                            card: (0, builder_1.toCardKit2)(completeCard),
+                            sequence: this.cardKit.cardKitSequence,
+                            accountId: this.deps.accountId,
+                        });
+                    }
+                    catch (updateErr) {
+                        // 300305 元素超限 — 拆分正文为多段，通过 IM patch 逐段发送
+                        if ((0, card_error_1.isCardElementExceedsError)(updateErr)) {
+                            log.warn('onIdle: final card update hit 300305, splitting and retrying via IM patch', {
+                                cardId: idleEffectiveCardId,
+                                textLen: terminalContent.text.length,
+                            });
+                            await this.sendTerminalContentSplit(terminalContent, idleToolUseDisplay, footerMetrics);
+                        }
+                        else {
+                            throw updateErr;
+                        }
+                    }
                 }
                 else {
-                    await (0, send_1.updateCardFeishu)({
-                        cfg: this.deps.cfg,
-                        messageId: this.cardKit.cardMessageId,
-                        card: completeCard,
-                        accountId: this.deps.accountId,
-                    });
+                    try {
+                        await (0, send_1.updateCardFeishu)({
+                            cfg: this.deps.cfg,
+                            messageId: this.cardKit.cardMessageId,
+                            card: completeCard,
+                            accountId: this.deps.accountId,
+                        });
+                    }
+                    catch (patchErr) {
+                        // 300305 元素超限 — 拆分正文为多段 IM patch
+                        if ((0, card_error_1.isCardElementExceedsError)(patchErr)) {
+                            log.warn('onIdle: IM patch hit 300305, splitting and retrying', {
+                                messageId: this.cardKit.cardMessageId,
+                                textLen: terminalContent.text.length,
+                            });
+                            await this.sendTerminalContentSplit(terminalContent, idleToolUseDisplay, footerMetrics);
+                        }
+                        else {
+                            throw patchErr;
+                        }
+                    }
                 }
                 log.info('reply completed, card finalized', {
                     elapsedMs: this.elapsed(),
@@ -964,6 +994,45 @@ class StreamingCardController {
                 });
                 return;
             }
+            // CardKit 流式会话已被服务端关闭（300309）— 新建卡片续流。
+            // 同一 messageId 的卡片流已死，降级 im.message.patch 救不回，
+            // 必须新建 CardKit 实体并发送新消息才能继续展示后续内容。
+            if ((0, card_error_1.isCardStreamingClosedError)(err)) {
+                log.warn('flushCardUpdate: streaming mode closed (300309), creating new card to continue', {
+                    seq: this.cardKit.cardKitSequence,
+                    cardId: this.cardKit.cardKitCardId,
+                });
+                const continued = await this.createContinuationCard();
+                if (continued) {
+                    // 新卡片已就绪，立即把当前累积文本推送到新卡
+                    const displayText = this.buildDisplayText();
+                    const resolvedText = this.imageResolver.resolveImages(displayText);
+                    if (resolvedText !== this.text.lastFlushedText) {
+                        const prevSeq = this.cardKit.cardKitSequence;
+                        this.cardKit.cardKitSequence += 1;
+                        log.debug('flushCardUpdate: continuation card seq bump', {
+                            seqBefore: prevSeq,
+                            seqAfter: this.cardKit.cardKitSequence,
+                        });
+                        await (0, cardkit_1.streamCardContent)({
+                            cfg: this.deps.cfg,
+                            cardId: this.cardKit.cardKitCardId,
+                            elementId: builder_1.STREAMING_ELEMENT_ID,
+                            content: (0, markdown_style_1.optimizeMarkdownStyle)(resolvedText),
+                            sequence: this.cardKit.cardKitSequence,
+                            accountId: this.deps.accountId,
+                        });
+                        this.text.lastFlushedText = resolvedText;
+                    }
+                    return;
+                }
+                // 新建卡片失败 — 禁用 CardKit 流式，等 onIdle 用 originalCardKitCardId 收尾
+                log.warn('flushCardUpdate: continuation card creation failed, disabling CardKit streaming', {
+                    seq: this.cardKit.cardKitSequence,
+                });
+                this.cardKit.cardKitCardId = null;
+                return;
+            }
             // 卡片表格数超出飞书限制（230099/11310）— 禁用 CardKit 流式，
             // 保留 originalCardKitCardId 供 onIdle 做最终 CardKit 更新
             if ((0, card_error_1.isCardTableLimitError)(err)) {
@@ -991,6 +1060,49 @@ class StreamingCardController {
             return this.text.accumulatedText ? this.text.accumulatedText + '\n\n' + reasoningDisplay : reasoningDisplay;
         }
         return this.text.accumulatedText;
+    }
+    /**
+     * 300309 续流：新建 CardKit 卡片实体并发送新消息。
+     *
+     * 飞书 CardKit 流式会话有服务端时限（实测约 10 分钟）。
+     * 超时后原卡片流已死，必须新建卡片才能继续展示内容。
+     * 成功返回 true 并更新 cardKit 状态；失败返回 false。
+     */
+    async createContinuationCard() {
+        try {
+            const cId = await (0, cardkit_1.createCardEntity)({
+                cfg: this.deps.cfg,
+                card: (0, builder_1.buildStreamingThinkingCard)(this.deps.toolUseDisplay.showToolUse),
+                accountId: this.deps.accountId,
+            });
+            if (!cId) {
+                throw new Error('card.create returned empty card_id');
+            }
+            const result = await (0, cardkit_1.sendCardByCardId)({
+                cfg: this.deps.cfg,
+                to: this.deps.chatId,
+                cardId: cId,
+                replyToMessageId: this.deps.replyToMessageId,
+                replyInThread: this.deps.replyInThread,
+                accountId: this.deps.accountId,
+            });
+            // 更新 cardKit 状态指向新卡片
+            this.cardKit.cardKitCardId = cId;
+            this.cardKit.originalCardKitCardId = cId;
+            this.cardKit.cardKitSequence = 1;
+            this.cardKit.cardMessageId = result.messageId;
+            this.text.lastFlushedText = ''; // 强制下一次 flush 推送全量文本
+            this.flush.setCardMessageReady(true);
+            log.info('created continuation CardKit card', {
+                cardId: cId,
+                messageId: result.messageId,
+            });
+            return true;
+        }
+        catch (err) {
+            log.warn('createContinuationCard failed', { error: String(err) });
+            return false;
+        }
     }
     async throttledCardUpdate() {
         if (this.guard.shouldSkip('throttledCardUpdate'))
@@ -1037,6 +1149,68 @@ class StreamingCardController {
     // ------------------------------------------------------------------
     finalizeCard(source, reason) {
         this.transition('completed', source, reason);
+    }
+    /**
+     * 300305 降级：把终态正文拆分为多段，通过 IM patch 逐段发送，
+     * 保证用户至少能收到完整内容（而不是永远看不到正文）。
+     *
+     * 拆分策略：按段落（\n\n）优先切分；若单段仍超限则按字符硬切。
+     * 每段单独发一条 IM patch 消息（复用同一 messageId 的卡片流已死时
+     * 改为 sendMessageFeishu 纯文本兜底）。
+     */
+    async sendTerminalContentSplit(terminalContent, toolUseDisplay, footerMetrics) {
+        const text = terminalContent.text;
+        const chunks = splitTextForCardLimit(text, FEISHU_TERMINAL_TEXT_CHUNK_TARGET);
+        log.info('sendTerminalContentSplit: splitting terminal content', {
+            totalLen: text.length,
+            chunkCount: chunks.length,
+        });
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            const isLast = i === chunks.length - 1;
+            // 最后一段附带 footer / reasoning；中间段仅正文
+            const chunkCard = (0, builder_1.buildCardContent)('complete', {
+                text: chunk,
+                reasoningText: isLast ? terminalContent.reasoningText : undefined,
+                reasoningElapsedMs: isLast ? this.reasoning.reasoningElapsedMs || undefined : undefined,
+                toolUseSteps: isLast ? toolUseDisplay?.steps : undefined,
+                toolUseTitleSuffix: isLast ? this.computeToolUseTitleSuffix(toolUseDisplay) : undefined,
+                toolUseElapsedMs: isLast ? this.visibleToolUseElapsedMs : undefined,
+                showToolUse: this.deps.toolUseDisplay.showToolUse,
+                elapsedMs: this.elapsed(),
+                footer: this.deps.resolvedFooter,
+                footerMetrics: isLast ? footerMetrics : undefined,
+            });
+            try {
+                await (0, send_1.updateCardFeishu)({
+                    cfg: this.deps.cfg,
+                    messageId: this.cardKit.cardMessageId,
+                    card: chunkCard,
+                    accountId: this.deps.accountId,
+                });
+            }
+            catch (err) {
+                // 单段仍超限（极端情况）— 再拆一半重试一次
+                if ((0, card_error_1.isCardElementExceedsError)(err) && chunk.length > 1000) {
+                    log.warn('sendTerminalContentSplit: chunk still exceeds, halving', {
+                        chunkIdx: i,
+                        chunkLen: chunk.length,
+                    });
+                    const half = splitTextForCardLimit(chunk, Math.floor(chunk.length / 2));
+                    for (const sub of half) {
+                        await (0, send_1.updateCardFeishu)({
+                            cfg: this.deps.cfg,
+                            messageId: this.cardKit.cardMessageId,
+                            card: (0, builder_1.buildCardContent)('complete', { text: sub }),
+                            accountId: this.deps.accountId,
+                        });
+                    }
+                }
+                else {
+                    throw err;
+                }
+            }
+        }
     }
     /**
      * Close streaming mode then update card content (shared by onError and abortCard).
@@ -1095,4 +1269,40 @@ function extractApiDetail(err) {
         return String(err);
     const e = err;
     return e.response?.data ? JSON.stringify(e.response.data) : String(err);
+}
+// ---------------------------------------------------------------------------
+// Text splitting helper for 300305 element-exceeds fallback
+// ---------------------------------------------------------------------------
+/** 经验性的单卡片正文安全上限 -- 留足 markdown 渲染余量（2026-09 实测 30K 字符安全）。 */
+const FEISHU_TERMINAL_TEXT_CHUNK_TARGET = 30000;
+/**
+ * 把长文本拆分为不超限的多段。
+ *
+ * 优先按段落（\n\n）切分保持语义完整；若单段仍超 target 则按字符硬切。
+ * 返回的每段长度均 ≤ target。
+ */
+function splitTextForCardLimit(text, target = FEISHU_TERMINAL_TEXT_CHUNK_TARGET) {
+    if (text.length <= target)
+        return [text];
+    // 先按段落切
+    const paragraphs = text.split('\n\n');
+    const chunks = [];
+    let current = '';
+    for (const para of paragraphs) {
+        if ((current + '\n\n' + para).length > target && current) {
+            chunks.push(current);
+            current = para;
+        }
+        else {
+            current = current ? current + '\n\n' + para : para;
+        }
+        // 单段仍超 target — 硬切
+        while (current.length > target) {
+            chunks.push(current.slice(0, target));
+            current = current.slice(target);
+        }
+    }
+    if (current)
+        chunks.push(current);
+    return chunks;
 }

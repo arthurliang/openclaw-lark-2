@@ -15,6 +15,8 @@ exports.extractSubCode = extractSubCode;
 exports.parseCardApiError = parseCardApiError;
 exports.isCardTableLimitError = isCardTableLimitError;
 exports.isCardRateLimitError = isCardRateLimitError;
+exports.isCardStreamingClosedError = isCardStreamingClosedError;
+exports.isCardElementExceedsError = isCardElementExceedsError;
 exports.findMarkdownTablesOutsideCodeBlocks = findMarkdownTablesOutsideCodeBlocks;
 exports.sanitizeTextSegmentsForCard = sanitizeTextSegmentsForCard;
 exports.sanitizeTextForCard = sanitizeTextForCard;
@@ -28,6 +30,10 @@ exports.CARD_ERROR = {
     RATE_LIMITED: 230020,
     /** 卡片内容创建失败（通用码，需检查子错误） */
     CARD_CONTENT_FAILED: 230099,
+    /** CardKit 流式会话已被服务端关闭（实测约 10 分钟上限） */
+    STREAMING_CLOSED: 300309,
+    /** 卡片元素大小/数量超限（单元素正文过长等） */
+    ELEMENT_EXCEEDS: 300305,
 };
 /** 230099 子错误码，嵌套在 msg 的 ErrCode 字段中。 */
 exports.CARD_CONTENT_SUB_ERROR = {
@@ -126,6 +132,33 @@ function isCardRateLimitError(err) {
     if (!parsed)
         return false;
     return parsed.code === exports.CARD_ERROR.RATE_LIMITED;
+}
+
+/**
+ * 判断错误是否为 CardKit 流式会话已被服务端关闭（300309）。
+ *
+ * 飞书 CardKit 流式会话存在服务端时限（实测约 10 分钟），
+ * 超时后所有 streamCardContent / card.update 调用都会返回此错误。
+ * 调用方应新建卡片续流，而不是在同一 messageId 上降级 patch。
+ */
+function isCardStreamingClosedError(err) {
+    const parsed = parseCardApiError(err);
+    if (!parsed)
+        return false;
+    return parsed.code === exports.CARD_ERROR.STREAMING_CLOSED;
+}
+
+/**
+ * 判断错误是否为卡片元素大小/数量超限（300305）。
+ *
+ * 与 230099/11310（表格数量超限）是不同 code，按 code 精确匹配。
+ * 通常在终态一次性写入超长正文时触发，调用方应拆分内容后重发。
+ */
+function isCardElementExceedsError(err) {
+    const parsed = parseCardApiError(err);
+    if (!parsed)
+        return false;
+    return parsed.code === exports.CARD_ERROR.ELEMENT_EXCEEDS;
 }
 // ---------------------------------------------------------------------------
 // Text sanitization
