@@ -36,6 +36,18 @@ const reply_dispatcher_types_1 = require("./reply-dispatcher-types.js");
 const unavailable_guard_1 = require("./unavailable-guard.js");
 const log = (0, lark_logger_1.larkLogger)('card/streaming');
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+/**
+ * 300309 续流次数上限。
+ *
+ * 飞书 CardKit 流式会话有服务端时限（实测约 10 分钟）。
+ * 每次续流新建一张卡片，若账户级限制导致持续 300309，
+ * 无上限会无限新建卡片。达到上限后禁用 CardKit 流式，
+ * 让 onIdle 走既有终态路径（含 300305 拆分兜底）收尾。
+ */
+const MAX_CARD_CONTINUATIONS = 3;
+// ---------------------------------------------------------------------------
 // StreamingCardController
 // ---------------------------------------------------------------------------
 class StreamingCardController {
@@ -47,6 +59,7 @@ class StreamingCardController {
         originalCardKitCardId: null,
         cardKitSequence: 0,
         cardMessageId: null,
+        continuationCount: 0,
     };
     text = {
         accumulatedText: '',
@@ -998,9 +1011,20 @@ class StreamingCardController {
             // 同一 messageId 的卡片流已死，降级 im.message.patch 救不回，
             // 必须新建 CardKit 实体并发送新消息才能继续展示后续内容。
             if ((0, card_error_1.isCardStreamingClosedError)(err)) {
+                // 续流次数护栏 — 防止持续 300309 导致无限新建卡片
+                if (this.cardKit.continuationCount >= MAX_CARD_CONTINUATIONS) {
+                    log.warn('flushCardUpdate: continuation limit reached, disabling CardKit streaming', {
+                        seq: this.cardKit.cardKitSequence,
+                        continuationCount: this.cardKit.continuationCount,
+                        maxContinuations: MAX_CARD_CONTINUATIONS,
+                    });
+                    this.cardKit.cardKitCardId = null;
+                    return;
+                }
                 log.warn('flushCardUpdate: streaming mode closed (300309), creating new card to continue', {
                     seq: this.cardKit.cardKitSequence,
                     cardId: this.cardKit.cardKitCardId,
+                    continuationCount: this.cardKit.continuationCount,
                 });
                 const continued = await this.createContinuationCard();
                 if (continued) {
@@ -1091,11 +1115,13 @@ class StreamingCardController {
             this.cardKit.originalCardKitCardId = cId;
             this.cardKit.cardKitSequence = 1;
             this.cardKit.cardMessageId = result.messageId;
+            this.cardKit.continuationCount += 1;
             this.text.lastFlushedText = ''; // 强制下一次 flush 推送全量文本
             this.flush.setCardMessageReady(true);
             log.info('created continuation CardKit card', {
                 cardId: cId,
                 messageId: result.messageId,
+                continuationCount: this.cardKit.continuationCount,
             });
             return true;
         }

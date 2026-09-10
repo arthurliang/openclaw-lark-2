@@ -203,6 +203,121 @@ describe("StreamingCardController — onIdle 300305 element exceeds", () => {
   });
 });
 
+describe("StreamingCardController — 300309 continuation limit guard", () => {
+  beforeEach(() => {
+    cardkit.streamCardContent = originalStreamCardContent;
+    cardkit.createCardEntity = originalCreateCardEntity;
+    cardkit.sendCardByCardId = originalSendCardByCardId;
+    cardkit.updateCardKitCard = originalUpdateCardKitCard;
+    cardkit.setCardStreamingMode = originalSetCardStreamingMode;
+    send.updateCardFeishu = originalUpdateCardFeishu;
+  });
+
+  it("still creates continuation card when under the limit", async () => {
+    const controller = createController();
+    controller.cardKit.cardMessageId = "om_old";
+    controller.cardKit.cardKitCardId = "card_1";
+    controller.cardKit.originalCardKitCardId = "card_1";
+    controller.cardKit.cardKitSequence = 3;
+    controller.text.accumulatedText = "text";
+    controller.flush.setCardMessageReady(true);
+
+    const mockStream = vi.fn()
+      .mockRejectedValueOnce({ code: 300309, msg: "streaming mode is closed" })
+      .mockResolvedValueOnce({ code: 0 });
+    cardkit.streamCardContent = mockStream;
+
+    const mockCreate = vi.fn().mockResolvedValue("card_2");
+    cardkit.createCardEntity = mockCreate;
+    cardkit.sendCardByCardId = vi.fn().mockResolvedValue({ messageId: "om_new" });
+
+    await controller.performFlush();
+
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    expect(controller.cardKit.cardKitCardId).toBe("card_2");
+    expect(controller.cardKit.continuationCount).toBe(1);
+  });
+
+  it("stops creating new cards after reaching MAX_CARD_CONTINUATIONS and degrades gracefully", async () => {
+    const controller = createController();
+    controller.cardKit.cardMessageId = "om_old";
+    controller.cardKit.cardKitCardId = "card_1";
+    controller.cardKit.originalCardKitCardId = "card_1";
+    controller.cardKit.cardKitSequence = 3;
+    controller.cardKit.continuationCount = 3; // already at limit
+    controller.text.accumulatedText = "text";
+    controller.flush.setCardMessageReady(true);
+
+    const mockStream = vi.fn().mockRejectedValue({ code: 300309, msg: "streaming mode is closed" });
+    cardkit.streamCardContent = mockStream;
+
+    const mockCreate = vi.fn();
+    cardkit.createCardEntity = mockCreate;
+
+    await controller.performFlush();
+
+    // Should NOT attempt to create a new card
+    expect(mockCreate).not.toHaveBeenCalled();
+    // Should have disabled CardKit streaming
+    expect(controller.cardKit.cardKitCardId).toBeNull();
+    // Count should stay at limit (not increment)
+    expect(controller.cardKit.continuationCount).toBe(3);
+  });
+
+  it("onIdle still delivers final content after continuation limit reached", async () => {
+    const controller = createController();
+    controller.cardKit.cardMessageId = "om_msg";
+    controller.cardKit.cardKitCardId = null; // CardKit disabled after limit
+    controller.cardKit.originalCardKitCardId = "card_orig";
+    controller.cardKit.cardKitSequence = 5;
+    controller.cardKit.continuationCount = 3;
+    controller.text.completedText = "Final answer content";
+    controller.dispatchFullyComplete = true;
+    controller.flush.setCardMessageReady(true);
+
+    const mockSetStreaming = vi.fn().mockResolvedValue({ code: 0 });
+    cardkit.setCardStreamingMode = mockSetStreaming;
+
+    const mockUpdate = vi.fn().mockResolvedValue({ code: 0 });
+    cardkit.updateCardKitCard = mockUpdate;
+
+    await controller.onIdle();
+
+    // Should have closed streaming on the original card
+    expect(mockSetStreaming).toHaveBeenCalledWith(
+      expect.objectContaining({ cardId: "card_orig", streamingMode: false })
+    );
+    // Should have updated the original card with final content
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ cardId: "card_orig" })
+    );
+  });
+
+  it("continuationCount resets to 0 for each new controller instance (per-run)", async () => {
+    const controller1 = createController();
+    controller1.cardKit.cardMessageId = "om_1";
+    controller1.cardKit.cardKitCardId = "card_a";
+    controller1.cardKit.originalCardKitCardId = "card_a";
+    controller1.cardKit.cardKitSequence = 1;
+    controller1.text.accumulatedText = "text";
+    controller1.flush.setCardMessageReady(true);
+
+    const mockStream1 = vi.fn()
+      .mockRejectedValueOnce({ code: 300309, msg: "closed" })
+      .mockResolvedValueOnce({ code: 0 });
+    cardkit.streamCardContent = mockStream1;
+    cardkit.createCardEntity = vi.fn().mockResolvedValue("card_b");
+    cardkit.sendCardByCardId = vi.fn().mockResolvedValue({ messageId: "om_2" });
+
+    await controller1.performFlush();
+    expect(controller1.cardKit.continuationCount).toBe(1);
+
+    // New controller instance (new run) — count starts at 0
+    const controller2 = createController();
+    expect(controller2.cardKit.continuationCount).toBe(0);
+  });
+});
+
 describe("StreamingCardController — existing error handling regression", () => {
   beforeEach(() => {
     // Restore originals
