@@ -47,6 +47,28 @@ const log = (0, lark_logger_1.larkLogger)('card/streaming');
  * 让 onIdle 走既有终态路径（含 300305 拆分兜底）收尾。
  */
 const MAX_CARD_CONTINUATIONS = 3;
+/**
+ * 流式卡片元素预算 —— 从源头避免撞 300305「element exceeds the limit」。
+ *
+ * 取值依据（⚠️ 不确定性如实标注）：
+ * - 飞书**未公布元素级上限**，无法给出权威口径；
+ * - 唯一可用的实测数据来自静态终态卡：30000 字符
+ *   （见 FEISHU_TERMINAL_TEXT_CHUNK_TARGET，2026-09 实测安全）；
+ * - 流式正文与终态正文同为单个 markdown 元素，故按同一口径保守外推，
+ *   再留约 20% 余量 → 24000 字符；
+ * - `maxElements`（Markdown 块数）与 `maxBytes`（UTF-8 字节）为二次预判，
+ *   飞书同样未公布，属经验值。
+ *
+ * 该预算可在运行时通过 deps.elementBudget 覆盖（可配置），便于按实测调整。
+ * 真实上限未知：若实测仍出现 300305，需下调；若过于保守可上调。
+ */
+const STREAMING_ELEMENT_BUDGET = {
+    maxChars: 24000,
+    // ≈ 24000 字符 × 2 字节（中英混排经验均值）
+    maxBytes: 48000,
+    // 单卡 Markdown 块数经验上限
+    maxElements: 100,
+};
 // ---------------------------------------------------------------------------
 // StreamingCardController
 // ---------------------------------------------------------------------------
@@ -60,6 +82,10 @@ class StreamingCardController {
         cardKitSequence: 0,
         cardMessageId: null,
         continuationCount: 0,
+        /** 已熔断的卡片（收到过 300305）— 此后禁止任何 CardKit 写入。 */
+        frozenCardIds: new Set(),
+        /** 已熔断卡片对应的 messageId — 流式路径禁止对它们再做 IM patch。 */
+        frozenMessageIds: new Set(),
     };
     text = {
         accumulatedText: '',
@@ -67,6 +93,10 @@ class StreamingCardController {
         streamingPrefix: '',
         lastPartialText: '',
         lastFlushedText: '',
+        /** 已展示过的正文前缀长度（当前窗口在 accumulatedText 中的起始下标）。 */
+        streamingOffsetChars: 0,
+        /** 上一次成功推送的窗口长度（收到 300305 时据此推进窗口起点）。 */
+        lastPushedWindowLen: 0,
     };
     reasoning = {
         accumulatedReasoningText: '',
@@ -533,7 +563,7 @@ class StreamingCardController {
         await this.flush.waitForFlush();
         if (this.cardCreationPromise)
             await this.cardCreationPromise;
-        const errorEffectiveCardId = this.cardKit.cardKitCardId ?? this.cardKit.originalCardKitCardId;
+        const errorEffectiveCardId = this.getWritableCardKitId();
         const footerMetrics = this.needsFooterMetrics() ? await this.getFooterSessionMetrics() : undefined;
         const toolUseDisplay = this.computeToolUseDisplay();
         try {
@@ -598,7 +628,7 @@ class StreamingCardController {
             await new Promise((resolve) => setTimeout(resolve, 0));
             await this.flush.waitForFlush();
         }
-        const idleEffectiveCardId = this.cardKit.cardKitCardId ?? this.cardKit.originalCardKitCardId;
+        const idleEffectiveCardId = this.getWritableCardKitId();
         try {
             if (this.cardKit.cardMessageId) {
                 if (idleEffectiveCardId) {
@@ -757,7 +787,7 @@ class StreamingCardController {
             await this.flush.waitForFlush();
             if (this.cardCreationPromise)
                 await this.cardCreationPromise;
-            const effectiveCardId = this.cardKit.cardKitCardId ?? this.cardKit.originalCardKitCardId;
+            const effectiveCardId = this.getWritableCardKitId();
             const elapsedMs = Date.now() - this.dispatchStartTime;
             const abortToolUseDisplay = this.computeToolUseDisplay();
             const terminalContent = prepareTerminalCardContent({
@@ -956,30 +986,20 @@ class StreamingCardController {
             isCardKit: !!this.cardKit.cardKitCardId,
         });
         try {
-            const displayText = this.buildDisplayText();
-            // 流式中间帧使用同步 resolveImages（不等待异步上传）
-            const resolvedText = this.imageResolver.resolveImages(displayText);
             if (this.cardKit.cardKitCardId) {
-                if (resolvedText !== this.text.lastFlushedText) {
-                    const prevSeq = this.cardKit.cardKitSequence;
-                    this.cardKit.cardKitSequence += 1;
-                    log.debug('flushCardUpdate: answer seq bump', {
-                        seqBefore: prevSeq,
-                        seqAfter: this.cardKit.cardKitSequence,
-                    });
-                    await (0, cardkit_1.streamCardContent)({
-                        cfg: this.deps.cfg,
-                        cardId: this.cardKit.cardKitCardId,
-                        elementId: builder_1.STREAMING_ELEMENT_ID,
-                        content: (0, markdown_style_1.optimizeMarkdownStyle)(resolvedText),
-                        sequence: this.cardKit.cardKitSequence,
-                        accountId: this.deps.accountId,
-                    });
-                    this.text.lastFlushedText = resolvedText;
-                }
+                await this.pushStreamingWindow();
+                // 窗口已满：先另起一张卡承接后续正文，避免撞上元素上限
+                if (this.isStreamingWindowFull())
+                    await this.rolloverFilledChunk();
             }
             else {
+                // 冻结卡的 message 不可再 patch —— 否则就是对同一张超限卡的原地重试
+                if (this.isFrozenMessage(this.cardKit.cardMessageId)) {
+                    log.debug('flushCardUpdate: skipping IM patch on a frozen card message');
+                    return;
+                }
                 log.debug('flushCardUpdate: IM patch fallback');
+                const resolvedText = this.imageResolver.resolveImages(this.buildDisplayText());
                 const flushDisplay = this.computeToolUseDisplay();
                 const card = (0, builder_1.buildCardContent)('streaming', {
                     text: this.reasoning.isReasoningPhase ? '' : resolvedText,
@@ -1011,50 +1031,18 @@ class StreamingCardController {
             // 同一 messageId 的卡片流已死，降级 im.message.patch 救不回，
             // 必须新建 CardKit 实体并发送新消息才能继续展示后续内容。
             if ((0, card_error_1.isCardStreamingClosedError)(err)) {
-                // 续流次数护栏 — 防止持续 300309 导致无限新建卡片
-                if (this.cardKit.continuationCount >= MAX_CARD_CONTINUATIONS) {
-                    log.warn('flushCardUpdate: continuation limit reached, disabling CardKit streaming', {
-                        seq: this.cardKit.cardKitSequence,
-                        continuationCount: this.cardKit.continuationCount,
-                        maxContinuations: MAX_CARD_CONTINUATIONS,
-                    });
-                    this.cardKit.cardKitCardId = null;
-                    return;
-                }
                 log.warn('flushCardUpdate: streaming mode closed (300309), creating new card to continue', {
                     seq: this.cardKit.cardKitSequence,
                     cardId: this.cardKit.cardKitCardId,
                     continuationCount: this.cardKit.continuationCount,
                 });
-                const continued = await this.createContinuationCard();
-                if (continued) {
-                    // 新卡片已就绪，立即把当前累积文本推送到新卡
-                    const displayText = this.buildDisplayText();
-                    const resolvedText = this.imageResolver.resolveImages(displayText);
-                    if (resolvedText !== this.text.lastFlushedText) {
-                        const prevSeq = this.cardKit.cardKitSequence;
-                        this.cardKit.cardKitSequence += 1;
-                        log.debug('flushCardUpdate: continuation card seq bump', {
-                            seqBefore: prevSeq,
-                            seqAfter: this.cardKit.cardKitSequence,
-                        });
-                        await (0, cardkit_1.streamCardContent)({
-                            cfg: this.deps.cfg,
-                            cardId: this.cardKit.cardKitCardId,
-                            elementId: builder_1.STREAMING_ELEMENT_ID,
-                            content: (0, markdown_style_1.optimizeMarkdownStyle)(resolvedText),
-                            sequence: this.cardKit.cardKitSequence,
-                            accountId: this.deps.accountId,
-                        });
-                        this.text.lastFlushedText = resolvedText;
-                    }
-                    return;
-                }
-                // 新建卡片失败 — 禁用 CardKit 流式，等 onIdle 用 originalCardKitCardId 收尾
-                log.warn('flushCardUpdate: continuation card creation failed, disabling CardKit streaming', {
-                    seq: this.cardKit.cardKitSequence,
-                });
-                this.cardKit.cardKitCardId = null;
+                await this.continueOnNewCard('300309');
+                return;
+            }
+            // 元素超限（300305）— 该卡已不可写：立即熔断冻结（禁止原地重试），
+            // 拆正文到新卡续流，避免在同一张超限卡上连续重试（生产事故 2026-09-12）。
+            if ((0, card_error_1.isCardElementExceedsError)(err)) {
+                await this.handleStreamingElementExceeds();
                 return;
             }
             // 卡片表格数超出飞书限制（230099/11310）— 禁用 CardKit 流式，
@@ -1079,11 +1067,165 @@ class StreamingCardController {
         }
     }
     buildDisplayText() {
+        const windowText = this.currentChunk().head;
         if (this.reasoning.isReasoningPhase && this.reasoning.accumulatedReasoningText) {
             const reasoningDisplay = `💭 **Thinking...**\n\n${this.reasoning.accumulatedReasoningText}`;
-            return this.text.accumulatedText ? this.text.accumulatedText + '\n\n' + reasoningDisplay : reasoningDisplay;
+            return windowText ? windowText + '\n\n' + reasoningDisplay : reasoningDisplay;
         }
-        return this.text.accumulatedText;
+        return windowText;
+    }
+    // ------------------------------------------------------------------
+    // Element budget + frozen-card guard (300305)
+    // ------------------------------------------------------------------
+    /** 当前生效的元素预算（常量可被 deps.elementBudget 覆盖，便于按实测调整）。 */
+    elementBudget() {
+        const override = this.deps.elementBudget;
+        return {
+            maxChars: override?.maxChars ?? STREAMING_ELEMENT_BUDGET.maxChars,
+            maxBytes: override?.maxBytes ?? STREAMING_ELEMENT_BUDGET.maxBytes,
+            maxElements: override?.maxElements ?? STREAMING_ELEMENT_BUDGET.maxElements,
+        };
+    }
+    /**
+     * 当前窗口：正文中尚未展示的部分里，能放进一张卡的第一段。
+     *
+     * 复用与终态一致的拆分 helper（段落优先），因此相邻卡片之间可能在
+     * 段落分隔符处有极小重叠 —— 宁可重叠，不可丢失正文。
+     */
+    currentChunk() {
+        const remaining = this.text.accumulatedText.slice(this.text.streamingOffsetChars);
+        const [head = ''] = splitTextForCardBudget(remaining, this.elementBudget());
+        return { head, hasMore: head.length < remaining.length };
+    }
+    /** 窗口已被填满（后面还有未展示的正文）→ 需要另起一张卡。 */
+    isStreamingWindowFull() {
+        return this.currentChunk().hasMore;
+    }
+    /** 写入前的预算预判：字节数 + 元素（Markdown 块）数。 */
+    exceedsElementBudget(text) {
+        const budget = this.elementBudget();
+        return (text.length > budget.maxChars ||
+            Buffer.byteLength(text, 'utf8') > budget.maxBytes ||
+            countMarkdownBlocks(text) > budget.maxElements);
+    }
+    isCardFrozen(cardId) {
+        return !!cardId && this.cardKit.frozenCardIds.has(cardId);
+    }
+    isFrozenMessage(messageId) {
+        return !!messageId && this.cardKit.frozenMessageIds.has(messageId);
+    }
+    /**
+     * 熔断一张卡：此后不得再对它发任何 cardElement.content / card.update /
+     * card.settings。生产事故（2026-09-12）中同一张超限卡被连续重试 8 次，
+     * 这里靠冻结状态从结构上杜绝重试。
+     */
+    freezeCard(cardId, reason) {
+        if (!cardId)
+            return;
+        this.cardKit.frozenCardIds.add(cardId);
+        if (this.cardKit.cardMessageId)
+            this.cardKit.frozenMessageIds.add(this.cardKit.cardMessageId);
+        if (this.cardKit.cardKitCardId === cardId)
+            this.cardKit.cardKitCardId = null;
+        if (this.cardKit.originalCardKitCardId === cardId)
+            this.cardKit.originalCardKitCardId = null;
+        log.warn('card frozen — no further CardKit writes to this card', {
+            cardId,
+            reason,
+            seq: this.cardKit.cardKitSequence,
+        });
+    }
+    /** 可写的 CardKit 卡片 ID（冻结卡一律不可写）。 */
+    getWritableCardKitId() {
+        const id = this.cardKit.cardKitCardId ?? this.cardKit.originalCardKitCardId;
+        if (!id || this.isCardFrozen(id))
+            return null;
+        return id;
+    }
+    /** 把当前窗口内容推送到当前卡片（冻结卡直接跳过）。 */
+    async pushStreamingWindow() {
+        const cardId = this.cardKit.cardKitCardId;
+        if (!cardId || this.isCardFrozen(cardId))
+            return false;
+        const windowText = this.buildDisplayText();
+        const resolvedText = this.imageResolver.resolveImages(windowText);
+        if (resolvedText === this.text.lastFlushedText)
+            return false;
+        const prevSeq = this.cardKit.cardKitSequence;
+        this.cardKit.cardKitSequence += 1;
+        log.debug('flushCardUpdate: answer seq bump', {
+            seqBefore: prevSeq,
+            seqAfter: this.cardKit.cardKitSequence,
+        });
+        await (0, cardkit_1.streamCardContent)({
+            cfg: this.deps.cfg,
+            cardId,
+            elementId: builder_1.STREAMING_ELEMENT_ID,
+            content: (0, markdown_style_1.optimizeMarkdownStyle)(resolvedText),
+            sequence: this.cardKit.cardKitSequence,
+            accountId: this.deps.accountId,
+        });
+        this.text.lastFlushedText = resolvedText;
+        this.text.lastPushedWindowLen = windowText.length;
+        return true;
+    }
+    /**
+     * 续卡：新建 CardKit 卡片并把当前窗口内容推上去（300309 / 300305 共用）。
+     * 超过续卡上限则禁用 CardKit 流式，交由 onIdle 走既有终态路径收尾。
+     */
+    async continueOnNewCard(reason) {
+        if (this.cardKit.continuationCount >= MAX_CARD_CONTINUATIONS) {
+            log.warn('flushCardUpdate: continuation limit reached, disabling CardKit streaming', {
+                seq: this.cardKit.cardKitSequence,
+                reason,
+                continuationCount: this.cardKit.continuationCount,
+                maxContinuations: MAX_CARD_CONTINUATIONS,
+            });
+            this.cardKit.cardKitCardId = null;
+            return false;
+        }
+        const continued = await this.createContinuationCard();
+        if (!continued) {
+            log.warn('flushCardUpdate: continuation card creation failed, disabling CardKit streaming', {
+                seq: this.cardKit.cardKitSequence,
+                reason,
+            });
+            this.cardKit.cardKitCardId = null;
+            return false;
+        }
+        await this.pushStreamingWindow();
+        return true;
+    }
+    /**
+     * 元素预算预分片：当前窗口已满，冻结当前卡并另起一张卡承接后续正文，
+     * 从源头避免撞上元素上限（而不是等 300305 发生后再补救）。
+     */
+    async rolloverFilledChunk() {
+        const currentCardId = this.cardKit.cardKitCardId;
+        const { head } = this.currentChunk();
+        log.info('flushCardUpdate: element budget reached, rolling over to a new card', {
+            seq: this.cardKit.cardKitSequence,
+            cardId: currentCardId,
+            windowChars: head.length,
+        });
+        this.text.streamingOffsetChars += head.length;
+        this.freezeCard(currentCardId, 'element-budget');
+        await this.continueOnNewCard('element-budget');
+    }
+    /**
+     * 300305 熔断：飞书对该卡返回元素超限（且响应体不提供任何细节），
+     * 立即冻结（禁止原地重试），把正文后续部分拆到新卡续流。
+     */
+    async handleStreamingElementExceeds() {
+        const frozenCardId = this.cardKit.cardKitCardId ?? this.cardKit.originalCardKitCardId;
+        this.text.streamingOffsetChars += this.text.lastPushedWindowLen;
+        log.warn('flushCardUpdate: element exceeds (300305), freezing card and continuing on a new one', {
+            seq: this.cardKit.cardKitSequence,
+            cardId: frozenCardId,
+            displayedChars: this.text.lastPushedWindowLen,
+        });
+        this.freezeCard(frozenCardId, '300305');
+        await this.continueOnNewCard('300305');
     }
     /**
      * 300309 续流：新建 CardKit 卡片实体并发送新消息。
@@ -1242,6 +1384,12 @@ class StreamingCardController {
      * Close streaming mode then update card content (shared by onError and abortCard).
      */
     async closeStreamingAndUpdate(cardId, card, label) {
+        if (this.isCardFrozen(cardId)) {
+            log.warn(`${label}: card is frozen (element limit), skipping CardKit close/update`, {
+                cardId,
+            });
+            return;
+        }
         const seqBeforeClose = this.cardKit.cardKitSequence;
         this.cardKit.cardKitSequence += 1;
         log.info(`${label}: closing streaming mode`, {
@@ -1302,33 +1450,57 @@ function extractApiDetail(err) {
 /** 经验性的单卡片正文安全上限 -- 留足 markdown 渲染余量（2026-09 实测 30K 字符安全）。 */
 const FEISHU_TERMINAL_TEXT_CHUNK_TARGET = 30000;
 /**
- * 把长文本拆分为不超限的多段。
+ * 把长文本按预算拆分为多段（通用版：终态正文与流式窗口共用同一拆分逻辑）。
  *
- * 优先按段落（\n\n）切分保持语义完整；若单段仍超 target 则按字符硬切。
- * 返回的每段长度均 ≤ target。
+ * 优先按段落（\n\n）切分保持语义完整；若单段仍超 maxChars 则按字符硬切。
+ * 返回的每段长度均 ≤ maxChars，块数 ≤ maxElements。
  */
-function splitTextForCardLimit(text, target = FEISHU_TERMINAL_TEXT_CHUNK_TARGET) {
-    if (text.length <= target)
+function splitTextForCardBudget(text, budget) {
+    const maxChars = budget?.maxChars ?? FEISHU_TERMINAL_TEXT_CHUNK_TARGET;
+    const maxElements = budget?.maxElements ?? Number.POSITIVE_INFINITY;
+    if (text.length <= maxChars && countMarkdownBlocks(text) <= maxElements)
         return [text];
     // 先按段落切
     const paragraphs = text.split('\n\n');
     const chunks = [];
     let current = '';
+    let currentBlocks = 0;
     for (const para of paragraphs) {
-        if ((current + '\n\n' + para).length > target && current) {
+        const next = current ? current + '\n\n' + para : para;
+        const overChars = next.length > maxChars;
+        const overElements = currentBlocks >= maxElements;
+        if ((overChars || overElements) && current) {
             chunks.push(current);
             current = para;
+            currentBlocks = 1;
         }
         else {
-            current = current ? current + '\n\n' + para : para;
+            current = next;
+            currentBlocks += 1;
         }
-        // 单段仍超 target — 硬切
-        while (current.length > target) {
-            chunks.push(current.slice(0, target));
-            current = current.slice(target);
+        // 单段仍超 maxChars — 硬切
+        while (current.length > maxChars) {
+            chunks.push(current.slice(0, maxChars));
+            current = current.slice(maxChars);
         }
     }
     if (current)
         chunks.push(current);
     return chunks;
+}
+/**
+ * 把长文本拆分为不超限的多段（终态口径：30K 字符）。
+ *
+ * 优先按段落（\n\n）切分保持语义完整；若单段仍超 target 则按字符硬切。
+ * 返回的每段长度均 ≤ target。
+ */
+function splitTextForCardLimit(text, target = FEISHU_TERMINAL_TEXT_CHUNK_TARGET) {
+    return splitTextForCardBudget(text, {
+        maxChars: target,
+        maxElements: Number.POSITIVE_INFINITY,
+    });
+}
+/** 统计 markdown 正文块数（\n\n 分隔）—— 卡片元素数量的经验近似。 */
+function countMarkdownBlocks(text) {
+    return text.split('\n\n').filter((block) => block.trim().length > 0).length;
 }

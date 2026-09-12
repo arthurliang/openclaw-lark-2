@@ -101,6 +101,18 @@ export declare class StreamingCardController {
     private deleteActivityCard;
     private performFlush;
     private buildDisplayText;
+    private elementBudget;
+    private currentChunk;
+    private isStreamingWindowFull;
+    private exceedsElementBudget;
+    isCardFrozen(cardId: string | null | undefined): boolean;
+    private isFrozenMessage;
+    private freezeCard;
+    private getWritableCardKitId;
+    private pushStreamingWindow;
+    private continueOnNewCard;
+    private rolloverFilledChunk;
+    private handleStreamingElementExceeds;
     private throttledCardUpdate;
     private lastToolUseStatusUpdateTime;
     private throttledToolUseStatusUpdate;
