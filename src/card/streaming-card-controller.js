@@ -1319,12 +1319,14 @@ class StreamingCardController {
         this.transition('completed', source, reason);
     }
     /**
-     * 300305 降级：把终态正文拆分为多段，通过 IM patch 逐段发送，
-     * 保证用户至少能收到完整内容（而不是永远看不到正文）。
+     * 300305 降级：把终态正文拆分为多段发送，保证用户收到完整内容。
+     *
+     * ⚠️ `im.message.patch` 是「整条消息替换」语义：对同一个 messageId 逐段
+     * patch 只会留下最后一段，前文被静默覆盖。因此
+     * ——首段复用原卡片消息（原地替换已经死掉的流式卡）；
+     * ——其余各段必须各自新发一条卡片消息（`im.message.create`）。
      *
      * 拆分策略：按段落（\n\n）优先切分；若单段仍超限则按字符硬切。
-     * 每段单独发一条 IM patch 消息（复用同一 messageId 的卡片流已死时
-     * 改为 sendMessageFeishu 纯文本兜底）。
      */
     async sendTerminalContentSplit(terminalContent, toolUseDisplay, footerMetrics) {
         const text = terminalContent.text;
@@ -1334,51 +1336,79 @@ class StreamingCardController {
             chunkCount: chunks.length,
         });
         for (let i = 0; i < chunks.length; i++) {
-            const chunk = chunks[i];
-            const isLast = i === chunks.length - 1;
-            // 最后一段附带 footer / reasoning；中间段仅正文
-            const chunkCard = (0, builder_1.buildCardContent)('complete', {
-                text: chunk,
-                reasoningText: isLast ? terminalContent.reasoningText : undefined,
-                reasoningElapsedMs: isLast ? this.reasoning.reasoningElapsedMs || undefined : undefined,
-                toolUseSteps: isLast ? toolUseDisplay?.steps : undefined,
-                toolUseTitleSuffix: isLast ? this.computeToolUseTitleSuffix(toolUseDisplay) : undefined,
-                toolUseElapsedMs: isLast ? this.visibleToolUseElapsedMs : undefined,
-                showToolUse: this.deps.toolUseDisplay.showToolUse,
-                elapsedMs: this.elapsed(),
-                footer: this.deps.resolvedFooter,
-                footerMetrics: isLast ? footerMetrics : undefined,
+            await this.deliverTerminalChunk({
+                chunk: chunks[i],
+                isFirst: i === 0,
+                includeFooter: i === chunks.length - 1,
+                terminalContent,
+                toolUseDisplay,
+                footerMetrics,
             });
-            try {
+        }
+    }
+    /**
+     * 交付终态正文的一段。
+     *
+     * - 首段：对原卡片消息做一次 IM patch（原地替换已死的流式卡）；
+     * - 其余段：各发一条新卡片消息 —— patch 同一条消息会互相覆盖；
+     * - 单段仍撞 300305（极端情况）：对半再拆，仍按「首段原地 / 其余新发」交付。
+     */
+    async deliverTerminalChunk({ chunk, isFirst, includeFooter, terminalContent, toolUseDisplay, footerMetrics }) {
+        const card = this.buildTerminalChunkCard(chunk, includeFooter, terminalContent, toolUseDisplay, footerMetrics);
+        try {
+            if (isFirst) {
                 await (0, send_1.updateCardFeishu)({
                     cfg: this.deps.cfg,
                     messageId: this.cardKit.cardMessageId,
-                    card: chunkCard,
+                    card,
                     accountId: this.deps.accountId,
                 });
             }
-            catch (err) {
-                // 单段仍超限（极端情况）— 再拆一半重试一次
-                if ((0, card_error_1.isCardElementExceedsError)(err) && chunk.length > 1000) {
-                    log.warn('sendTerminalContentSplit: chunk still exceeds, halving', {
-                        chunkIdx: i,
-                        chunkLen: chunk.length,
-                    });
-                    const half = splitTextForCardLimit(chunk, Math.floor(chunk.length / 2));
-                    for (const sub of half) {
-                        await (0, send_1.updateCardFeishu)({
-                            cfg: this.deps.cfg,
-                            messageId: this.cardKit.cardMessageId,
-                            card: (0, builder_1.buildCardContent)('complete', { text: sub }),
-                            accountId: this.deps.accountId,
-                        });
-                    }
-                }
-                else {
-                    throw err;
-                }
+            else {
+                await (0, send_1.sendCardFeishu)({
+                    cfg: this.deps.cfg,
+                    to: this.deps.chatId,
+                    card,
+                    replyToMessageId: this.deps.replyToMessageId,
+                    replyInThread: this.deps.replyInThread,
+                    accountId: this.deps.accountId,
+                });
             }
         }
+        catch (err) {
+            if (!(0, card_error_1.isCardElementExceedsError)(err) || chunk.length <= 1000)
+                throw err;
+            log.warn('deliverTerminalChunk: chunk still exceeds, halving into separate messages', {
+                chunkLen: chunk.length,
+                isFirst,
+            });
+            const halves = splitTextForCardLimit(chunk, Math.floor(chunk.length / 2));
+            for (let j = 0; j < halves.length; j++) {
+                await this.deliverTerminalChunk({
+                    chunk: halves[j],
+                    isFirst: isFirst && j === 0,
+                    includeFooter: includeFooter && j === halves.length - 1,
+                    terminalContent,
+                    toolUseDisplay,
+                    footerMetrics,
+                });
+            }
+        }
+    }
+    /** 构建终态正文某一段的卡片（reasoning / footer 只挂在最后一段）。 */
+    buildTerminalChunkCard(chunk, includeFooter, terminalContent, toolUseDisplay, footerMetrics) {
+        return (0, builder_1.buildCardContent)('complete', {
+            text: chunk,
+            reasoningText: includeFooter ? terminalContent.reasoningText : undefined,
+            reasoningElapsedMs: includeFooter ? this.reasoning.reasoningElapsedMs || undefined : undefined,
+            toolUseSteps: includeFooter ? toolUseDisplay?.steps : undefined,
+            toolUseTitleSuffix: includeFooter ? this.computeToolUseTitleSuffix(toolUseDisplay) : undefined,
+            toolUseElapsedMs: includeFooter ? this.visibleToolUseElapsedMs : undefined,
+            showToolUse: this.deps.toolUseDisplay.showToolUse,
+            elapsedMs: this.elapsed(),
+            footer: this.deps.resolvedFooter,
+            footerMetrics: includeFooter ? footerMetrics : undefined,
+        });
     }
     /**
      * Close streaming mode then update card content (shared by onError and abortCard).

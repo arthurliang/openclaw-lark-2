@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const cardkit = require("../../src/card/cardkit.js");
@@ -14,6 +14,13 @@ const originalSendCardByCardId = cardkit.sendCardByCardId;
 const originalUpdateCardKitCard = cardkit.updateCardKitCard;
 const originalSetCardStreamingMode = cardkit.setCardStreamingMode;
 const originalUpdateCardFeishu = send.updateCardFeishu;
+const originalSendCardFeishu = send.sendCardFeishu;
+
+// A terminal split sends its tail segments as brand-new card messages; keep
+// the real network path out of every test in this file.
+afterEach(() => {
+  send.sendCardFeishu = originalSendCardFeishu;
+});
 
 function createMockDeps(overrides = {}) {
   return {
@@ -162,6 +169,8 @@ describe("StreamingCardController — onIdle 300305 element exceeds", () => {
     // updateCardFeishu (IM fallback) succeeds
     const mockPatch = vi.fn().mockResolvedValue({ code: 0 });
     send.updateCardFeishu = mockPatch;
+    const mockSendCard = vi.fn().mockResolvedValue({ messageId: "om_cont" });
+    send.sendCardFeishu = mockSendCard;
 
     await controller.onIdle();
 
@@ -178,6 +187,9 @@ describe("StreamingCardController — onIdle 300305 element exceeds", () => {
       const textContent = card.elements?.find((e: any) => e.tag === "markdown")?.content ?? "";
       expect(textContent.length).toBeLessThan(50000);
     }
+    // The tail segment must land on a NEW message — re-patching the same
+    // messageId would overwrite it and the user would lose the tail.
+    expect(mockSendCard).toHaveBeenCalledTimes(1);
   });
 
   it("onIdle catches 300305 and retries with smaller chunks on IM patch", async () => {
@@ -195,6 +207,8 @@ describe("StreamingCardController — onIdle 300305 element exceeds", () => {
       .mockRejectedValueOnce({ code: 300305, msg: "element exceeds the limit" })
       .mockResolvedValue({ code: 0 });
     send.updateCardFeishu = mockPatch;
+    const mockSendCard = vi.fn().mockResolvedValue({ messageId: "om_cont" });
+    send.sendCardFeishu = mockSendCard;
 
     await controller.onIdle();
 

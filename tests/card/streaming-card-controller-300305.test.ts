@@ -13,6 +13,7 @@ const originalSendCardByCardId = cardkit.sendCardByCardId;
 const originalUpdateCardKitCard = cardkit.updateCardKitCard;
 const originalSetCardStreamingMode = cardkit.setCardStreamingMode;
 const originalUpdateCardFeishu = send.updateCardFeishu;
+const originalSendCardFeishu = send.sendCardFeishu;
 
 function createMockDeps(overrides = {}) {
   return {
@@ -57,6 +58,7 @@ beforeEach(() => {
   cardkit.updateCardKitCard = originalUpdateCardKitCard;
   cardkit.setCardStreamingMode = originalSetCardStreamingMode;
   send.updateCardFeishu = originalUpdateCardFeishu;
+  send.sendCardFeishu = originalSendCardFeishu;
 });
 
 describe("StreamingCardController — 300305 in the streaming flush path", () => {
@@ -235,5 +237,37 @@ describe("StreamingCardController — element budget pre-slicing", () => {
     expect(mockCreate).not.toHaveBeenCalled();
     expect(controller.isCardFrozen("card_1")).toBe(false);
     expect(controller.cardKit.cardKitCardId).toBe("card_1");
+  });
+});
+
+describe("StreamingCardController — terminal split must not overwrite earlier chunks", () => {
+  /** Markdown body of a rendered card (the piece the user actually reads). */
+  const markdownOf = (card) =>
+    card?.elements?.find((e) => e.tag === "markdown")?.content ?? "";
+
+  it("delivers every chunk on its own message instead of re-patching one messageId", async () => {
+    const controller = createStreamingController();
+    controller.cardKit.cardMessageId = "om_card";
+
+    const patch = vi.fn().mockResolvedValue({ code: 0 });
+    const sendCard = vi.fn().mockResolvedValue({ messageId: "om_new" });
+    send.updateCardFeishu = patch;
+    send.sendCardFeishu = sendCard;
+
+    // Three segments, each at the terminal chunk target — forces 3 chunks.
+    const text =
+      "A".repeat(30000) + "\n\n" + "B".repeat(30000) + "\n\n" + "C".repeat(30000);
+    await controller.sendTerminalContentSplit({ text }, undefined, undefined);
+
+    // Chunk 0 replaces the (dead) card message in place...
+    expect(patch).toHaveBeenCalledTimes(1);
+    expect(markdownOf(patch.mock.calls[0][0].card)).toContain("A".repeat(100));
+
+    // ...and the remaining chunks each reach their OWN message. Patching the
+    // same messageId repeatedly would overwrite, leaving only the last one.
+    expect(sendCard).toHaveBeenCalledTimes(2);
+    const sent = sendCard.mock.calls.map((c) => markdownOf(c[0].card));
+    expect(sent.some((t) => t.includes("B".repeat(100)))).toBe(true);
+    expect(sent.some((t) => t.includes("C".repeat(100)))).toBe(true);
   });
 });
