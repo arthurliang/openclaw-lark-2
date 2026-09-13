@@ -174,22 +174,19 @@ describe("StreamingCardController — onIdle 300305 element exceeds", () => {
 
     await controller.onIdle();
 
-    // Should have tried CardKit update first
+    // CardKit final update was attempted once, then hit 300305.
     expect(mockUpdate).toHaveBeenCalledTimes(1);
-    // Should have fallen back to IM patch with split content
-    expect(mockPatch).toHaveBeenCalled();
-    // The IM patch should have been called with a smaller chunk
-    const patchCalls = mockPatch.mock.calls;
-    expect(patchCalls.length).toBeGreaterThan(0);
-    // Each patch call should have text smaller than the original
-    for (const call of patchCalls) {
+    // 2026-09-13 fix: the first split chunk must NOT patch the (dead, schema-2.0)
+    // card message — that triggers "schemaV2 card can not change schemaV1" and
+    // froze the card. All chunks now land on brand-new messages.
+    expect(mockPatch).not.toHaveBeenCalled();
+    // 50000 chars → 2 chunks, each on its own new message.
+    expect(mockSendCard).toHaveBeenCalledTimes(2);
+    for (const call of mockSendCard.mock.calls) {
       const card = call[0].card;
       const textContent = card.elements?.find((e: any) => e.tag === "markdown")?.content ?? "";
       expect(textContent.length).toBeLessThan(50000);
     }
-    // The tail segment must land on a NEW message — re-patching the same
-    // messageId would overwrite it and the user would lose the tail.
-    expect(mockSendCard).toHaveBeenCalledTimes(1);
   });
 
   it("onIdle catches 300305 and retries with smaller chunks on IM patch", async () => {
@@ -202,7 +199,7 @@ describe("StreamingCardController — onIdle 300305 element exceeds", () => {
     controller.dispatchFullyComplete = true;
     controller.flush.setCardMessageReady(true);
 
-    // updateCardFeishu throws 300305 first, then succeeds
+    // updateCardFeishu throws 300305 on the initial full-card patch attempt.
     const mockPatch = vi.fn()
       .mockRejectedValueOnce({ code: 300305, msg: "element exceeds the limit" })
       .mockResolvedValue({ code: 0 });
@@ -212,8 +209,12 @@ describe("StreamingCardController — onIdle 300305 element exceeds", () => {
 
     await controller.onIdle();
 
-    // Should have retried with split chunks
-    expect(mockPatch.mock.calls.length).toBeGreaterThan(1);
+    // Only the initial full-card patch attempt hits the old message (once).
+    expect(mockPatch).toHaveBeenCalledTimes(1);
+    // 2026-09-13 fix: the split retry no longer re-patches the old card —
+    // every split chunk is delivered as a new message instead.
+    // 60000 chars → 2 chunks on new messages.
+    expect(mockSendCard).toHaveBeenCalledTimes(2);
   });
 });
 

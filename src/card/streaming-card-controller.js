@@ -1321,10 +1321,13 @@ class StreamingCardController {
     /**
      * 300305 降级：把终态正文拆分为多段发送，保证用户收到完整内容。
      *
-     * ⚠️ `im.message.patch` 是「整条消息替换」语义：对同一个 messageId 逐段
-     * patch 只会留下最后一段，前文被静默覆盖。因此
-     * ——首段复用原卡片消息（原地替换已经死掉的流式卡）；
-     * ——其余各段必须各自新发一条卡片消息（`im.message.create`）。
+     * ⚠️ 所有段（含首段）统一以**新消息**投递（`im.message.create`），
+     * 不再 patch 原卡片消息。原因：
+     * ——原卡片可能是 CardKit schema 2.0 卡，而 patch 载荷是 schema 1.0，
+     *   飞书会拒绝 "schemaV2 card can not change schemaV1"（230099/200830）；
+     * ——`im.message.patch` 是「整条消息替换」语义，逐段 patch 同一 messageId
+     *   只会留下最后一段，前文被静默覆盖。
+     * 新消息投递既规避 schema 冲突，也避免覆盖，且各段互不影响。
      *
      * 拆分策略：按段落（\n\n）优先切分；若单段仍超限则按字符硬切。
      */
@@ -1349,31 +1352,24 @@ class StreamingCardController {
     /**
      * 交付终态正文的一段。
      *
-     * - 首段：对原卡片消息做一次 IM patch（原地替换已死的流式卡）；
-     * - 其余段：各发一条新卡片消息 —— patch 同一条消息会互相覆盖；
-     * - 单段仍撞 300305（极端情况）：对半再拆，仍按「首段原地 / 其余新发」交付。
+     * - 所有段（含首段）统一以新卡片消息投递（`im.message.create`）：
+     *   不 patch 原卡，规避 schema 2.0/1.0 冲突与同 messageId 覆盖；
+     * - 单段仍撞 300305（极端情况）：对半再拆，各半仍按新消息交付。
+     *
+     * 注：`isFirst` 保留仅为兼容递归调用签名，不再影响投递方式。
      */
     async deliverTerminalChunk({ chunk, isFirst, includeFooter, terminalContent, toolUseDisplay, footerMetrics }) {
         const card = this.buildTerminalChunkCard(chunk, includeFooter, terminalContent, toolUseDisplay, footerMetrics);
         try {
-            if (isFirst) {
-                await (0, send_1.updateCardFeishu)({
-                    cfg: this.deps.cfg,
-                    messageId: this.cardKit.cardMessageId,
-                    card,
-                    accountId: this.deps.accountId,
-                });
-            }
-            else {
-                await (0, send_1.sendCardFeishu)({
-                    cfg: this.deps.cfg,
-                    to: this.deps.chatId,
-                    card,
-                    replyToMessageId: this.deps.replyToMessageId,
-                    replyInThread: this.deps.replyInThread,
-                    accountId: this.deps.accountId,
-                });
-            }
+            // 300305 兜底：所有段统一新发，绝不 patch 原卡（schema 冲突 + 覆盖）。
+            await (0, send_1.sendCardFeishu)({
+                cfg: this.deps.cfg,
+                to: this.deps.chatId,
+                card,
+                replyToMessageId: this.deps.replyToMessageId,
+                replyInThread: this.deps.replyInThread,
+                accountId: this.deps.accountId,
+            });
         }
         catch (err) {
             if (!(0, card_error_1.isCardElementExceedsError)(err) || chunk.length <= 1000)

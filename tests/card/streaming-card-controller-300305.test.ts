@@ -259,15 +259,57 @@ describe("StreamingCardController — terminal split must not overwrite earlier 
       "A".repeat(30000) + "\n\n" + "B".repeat(30000) + "\n\n" + "C".repeat(30000);
     await controller.sendTerminalContentSplit({ text }, undefined, undefined);
 
-    // Chunk 0 replaces the (dead) card message in place...
-    expect(patch).toHaveBeenCalledTimes(1);
-    expect(markdownOf(patch.mock.calls[0][0].card)).toContain("A".repeat(100));
+    // Fix for the 2026-09-13 production incident: the FIRST chunk must no
+    // longer patch the (dead, possibly schema-2.0) card message in place.
+    // Patching it with a schema-1.0 payload triggers
+    // "schemaV2 card can not change schemaV1" (230099/200830 → HTTP 400),
+    // which aborted the whole split loop and froze the card. All chunks —
+    // including the first — are now delivered as brand-new messages.
+    expect(patch).not.toHaveBeenCalled();
 
-    // ...and the remaining chunks each reach their OWN message. Patching the
-    // same messageId repeatedly would overwrite, leaving only the last one.
-    expect(sendCard).toHaveBeenCalledTimes(2);
+    // Every chunk reaches its OWN new message; nothing is lost or overwritten.
+    expect(sendCard).toHaveBeenCalledTimes(3);
     const sent = sendCard.mock.calls.map((c) => markdownOf(c[0].card));
+    expect(sent.some((t) => t.includes("A".repeat(100)))).toBe(true);
     expect(sent.some((t) => t.includes("B".repeat(100)))).toBe(true);
     expect(sent.some((t) => t.includes("C".repeat(100)))).toBe(true);
+  });
+
+  it("onIdle 300305 fallback: first chunk lands via a new message, never a patch, and does not throw", async () => {
+    // Reproduce the production path: a live CardKit (schema 2.0) card whose
+    // final update hits 300305. The fallback must deliver the first chunk on a
+    // NEW message (not by patching the schema-2.0 card) and must not surface a
+    // hard failure to the caller.
+    const controller = seedLiveCard(createStreamingController(), {
+      cardId: "card_kit",
+      messageId: "om_kit",
+      seq: 48,
+      text: "",
+    });
+    controller.text.completedText = "A".repeat(50000); // > 30000 → 2 chunks
+    controller.dispatchFullyComplete = true;
+
+    cardkit.setCardStreamingMode = vi.fn().mockResolvedValue({ code: 0 });
+    // CardKit final update rejects with the production 300305.
+    cardkit.updateCardKitCard = vi.fn().mockRejectedValue(PRODUCTION_300305);
+
+    const patch = vi.fn().mockResolvedValue({ code: 0 });
+    const sendCard = vi.fn().mockResolvedValue({ messageId: "om_split" });
+    send.updateCardFeishu = patch;
+    send.sendCardFeishu = sendCard;
+
+    // Must not throw — the outer onIdle used to swallow the 400 here, leaving
+    // the card frozen. Now the split lands cleanly.
+    await expect(controller.onIdle()).resolves.toBeUndefined();
+
+    // CardKit final update was attempted exactly once...
+    expect(cardkit.updateCardKitCard).toHaveBeenCalledTimes(1);
+    // ...and the first chunk was NOT delivered by patching the old card.
+    expect(patch).not.toHaveBeenCalled();
+    // Content successfully landed: both chunks on new messages.
+    expect(sendCard).toHaveBeenCalledTimes(2);
+    const sent = sendCard.mock.calls.map((c) => markdownOf(c[0].card));
+    expect(sent.every((t) => t.length > 0)).toBe(true);
+    expect(sent.some((t) => t.includes("A".repeat(100)))).toBe(true);
   });
 });
