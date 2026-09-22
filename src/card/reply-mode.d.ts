@@ -19,14 +19,21 @@ export declare function resolveReplyMode(params: {
     chatType?: 'p2p' | 'group';
 }): ReplyModeValue;
 /**
+ * Normalize the streaming switch across both config shapes.
+ *
+ * Legacy boolean (true) or OpenClaw 9.3 unified object { mode }.
+ * Returns true when streaming (and its footer) should be enabled.
+ */
+export declare function isStreamingEnabled(streaming: unknown): boolean;
+/**
  * Expand "auto" mode to a concrete mode based on streaming flag and chat type.
  *
- * When streaming === true: group → static, direct → streaming (legacy behavior).
+ * When streaming is enabled: group → static, direct → streaming (legacy behavior).
  * When streaming is unset: always static (new default).
  */
 export declare function expandAutoMode(params: {
     mode: ReplyModeValue;
-    streaming: boolean | undefined;
+    streaming: boolean | { mode?: string } | undefined;
     chatType?: 'p2p' | 'group';
 }): 'static' | 'streaming';
 /**

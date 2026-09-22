@@ -166,7 +166,16 @@ exports.FeishuAccountConfigSchema = zod_1.z.object({
     mediaMaxMb: zod_1.z.number().optional(),
     heartbeat: HeartbeatSchema,
     replyMode: ReplyModeSchema,
-    streaming: zod_1.z.boolean().optional(),
+    streaming: zod_1.z
+        .union([
+        zod_1.z.boolean(),
+        // OpenClaw 9.3 unified streaming mode object (channel-compat-normalization maps
+        // legacy booleans to { mode: "partial" | "off" }); accept both shapes.
+        zod_1.z
+            .object({ mode: zod_1.z.enum(['off', 'partial', 'block', 'progress']) })
+            .loose(),
+    ])
+        .optional(),
     blockStreaming: zod_1.z.boolean().optional(),
     // Merge multiple image URLs into one rich-text post ("post", default) or
     // keep the legacy per-image sends ("sequential").

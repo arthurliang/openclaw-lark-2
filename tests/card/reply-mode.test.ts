@@ -4,6 +4,7 @@ const {
   resolveReplyMode,
   expandAutoMode,
   shouldUseCard,
+  isStreamingEnabled,
 } = require("../../src/card/reply-mode.js");
 
 describe("reply-mode", () => {
@@ -33,6 +34,14 @@ describe("reply-mode", () => {
       const cfg = { streaming: true, replyMode: { default: "static" } };
       expect(resolveReplyMode({ feishuCfg: cfg, chatType: "group" })).toBe("static");
     });
+
+    it("accepts OpenClaw 9.3 unified object form { mode } for streaming", () => {
+      expect(resolveReplyMode({ feishuCfg: { streaming: { mode: "partial" } }, chatType: "p2p" })).toBe("auto");
+      expect(resolveReplyMode({ feishuCfg: { streaming: { mode: "block" } }, chatType: "p2p" })).toBe("auto");
+      expect(resolveReplyMode({ feishuCfg: { streaming: { mode: "progress" } }, chatType: "p2p" })).toBe("auto");
+      expect(resolveReplyMode({ feishuCfg: { streaming: { mode: "off" } }, chatType: "p2p" })).toBe("static");
+      expect(resolveReplyMode({ feishuCfg: { streaming: { mode: "partial" }, replyMode: "streaming" }, chatType: "group" })).toBe("streaming");
+    });
   });
 
   describe("expandAutoMode", () => {
@@ -49,6 +58,26 @@ describe("reply-mode", () => {
     it("expands auto to static when streaming not enabled", () => {
       expect(expandAutoMode({ mode: "auto", streaming: false, chatType: "p2p" })).toBe("static");
       expect(expandAutoMode({ mode: "auto", streaming: undefined, chatType: "group" })).toBe("static");
+    });
+
+    it("expands auto with unified object streaming form", () => {
+      expect(expandAutoMode({ mode: "auto", streaming: { mode: "partial" }, chatType: "group" })).toBe("static");
+      expect(expandAutoMode({ mode: "auto", streaming: { mode: "partial" }, chatType: "p2p" })).toBe("streaming");
+      expect(expandAutoMode({ mode: "auto", streaming: { mode: "off" }, chatType: "p2p" })).toBe("static");
+    });
+  });
+
+  describe("isStreamingEnabled normalization", () => {
+    it("normalizes legacy boolean and 9.3 object forms", () => {
+      expect(isStreamingEnabled(true)).toBe(true);
+      expect(isStreamingEnabled(false)).toBe(false);
+      expect(isStreamingEnabled(undefined)).toBe(false);
+      expect(isStreamingEnabled({ mode: "partial" })).toBe(true);
+      expect(isStreamingEnabled({ mode: "block" })).toBe(true);
+      expect(isStreamingEnabled({ mode: "progress" })).toBe(true);
+      expect(isStreamingEnabled({ mode: "off" })).toBe(false);
+      expect(isStreamingEnabled({})).toBe(false);
+      expect(isStreamingEnabled("partial")).toBe(false);
     });
   });
 

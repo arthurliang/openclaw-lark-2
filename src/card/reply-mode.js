@@ -12,7 +12,28 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.resolveReplyMode = resolveReplyMode;
 exports.expandAutoMode = expandAutoMode;
 exports.shouldUseCard = shouldUseCard;
+exports.isStreamingEnabled = isStreamingEnabled;
 const card_error_1 = require("./card-error.js");
+// ---------------------------------------------------------------------------
+// isStreamingEnabled
+// ---------------------------------------------------------------------------
+/**
+ * Normalize the streaming switch across both config shapes.
+ *
+ * Legacy: boolean (true = streaming on).
+ * OpenClaw 9.3 unified schema: { mode: "off" | "partial" | "block" | "progress" }.
+ * The core compat layer maps legacy booleans via `entry.streaming ? "partial" : "off"`,
+ * so any non-"off" mode keeps streaming enabled (and its footer with it).
+ */
+function isStreamingEnabled(streaming) {
+    if (streaming === true)
+        return true;
+    if (streaming && typeof streaming === 'object' && !Array.isArray(streaming)) {
+        const mode = typeof streaming.mode === 'string' ? streaming.mode : undefined;
+        return mode !== undefined && mode !== 'off';
+    }
+    return false;
+}
 // ---------------------------------------------------------------------------
 // resolveReplyMode
 // ---------------------------------------------------------------------------
@@ -23,8 +44,9 @@ const card_error_1 = require("./card-error.js");
  */
 function resolveReplyMode(params) {
     const { feishuCfg, chatType } = params;
-    // streaming 布尔总开关：仅 true 时允许流式，未设置或 false 一律 static
-    if (feishuCfg?.streaming !== true)
+    // streaming 总开关：兼容旧布尔（true）与 9.3 统一对象形态（{mode:"partial"|"block"|"progress"}）；
+    // off/未设置/false 一律 static
+    if (!isStreamingEnabled(feishuCfg?.streaming))
         return 'static';
     const replyMode = feishuCfg?.replyMode;
     if (!replyMode)
@@ -48,7 +70,7 @@ function expandAutoMode(params) {
     const { mode, streaming, chatType } = params;
     if (mode !== 'auto')
         return mode;
-    return streaming === true ? (chatType === 'group' ? 'static' : 'streaming') : 'static';
+    return isStreamingEnabled(streaming) ? (chatType === 'group' ? 'static' : 'streaming') : 'static';
 }
 // ---------------------------------------------------------------------------
 // shouldUseCard
